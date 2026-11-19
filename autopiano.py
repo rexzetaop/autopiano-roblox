@@ -66,6 +66,8 @@ SONG_SETTINGS_FILE = os.path.join(_APP_DIR, "autopiano_songsettings.json")
 COMPARTIDAS_FILE = os.path.join(_APP_DIR, "autopiano_compartidas.json")
 SECCIONES_FILE = os.path.join(_APP_DIR, "autopiano_secciones.json")
 COLORES_FILE = os.path.join(_APP_DIR, "autopiano_colores.json")
+RECORDS_FILE = os.path.join(_APP_DIR, "autopiano_records.json")
+CUENTA_FILE = os.path.join(_APP_DIR, "autopiano_cuenta.json")
 
 # Paleta de la interfaz: el usuario puede cambiar cada uno (código hex
 # tipo #ffffff o con las barras RGB). Se guarda en autopiano_colores.json
@@ -1032,6 +1034,235 @@ def _web_http_get(url: str, timeout: int = 20) -> str:
     return raw.decode(charset or "utf-8", errors="replace")
 
 
+# ======================================================================
+# v4.23 — Nube de partituras, canciones de la comunidad y récords
+# ======================================================================
+GITHUB_API = "https://api.github.com"
+NUBE_GIST_NOMBRE = "AutoPiano - mis partituras"
+COMUNIDAD_DIR = "partituras"       # carpeta de canciones en el repo
+COMUNIDAD_REPO = ACTUALIZACION_REPO
+
+
+def _github_api(ruta: str, metodo: str = "GET", cuerpo: dict = None,
+                token: str = None):
+    """Llamada a la API de GitHub. Devuelve el dict/objeto JSON o None si
+    algo falla (sin excepciones hacia arriba). `ruta` es p.ej.
+    "repos/x/y/contents/archivo" (sin /repos/ inicial)."""
+    import urllib.request
+    url = f"{GITHUB_API}/{ruta.lstrip('/')}"
+    data = None
+    if cuerpo is not None:
+        data = json.dumps(cuerpo).encode("utf-8")
+    encabezados = {"User-Agent": _WEB_UA,
+                   "Accept": "application/vnd.github+json"}
+    if token:
+        encabezados["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(url, data=data, method=metodo,
+                                     headers=encabezados)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            texto = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(texto) if texto else {}
+        except Exception:
+            return texto
+    except Exception:
+        return None
+
+
+def _gh_token():
+    """Token de GitHub del usuario, si existe: primero autopiano_cuenta.json
+    ({"token": ...}), después el Administrador de credenciales de Windows
+    donde gh CLI dejó el suyo (target gh:github.com:...). "" si no hay."""
+    try:
+        if os.path.exists(CUENTA_FILE):
+            with open(CUENTA_FILE, "r", encoding="utf-8-sig") as f:
+                tok = (json.load(f) or {}).get("token")
+            if isinstance(tok, str) and tok.strip():
+                return tok.strip()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [("Flags", wintypes.DWORD),
+                        ("Type", wintypes.DWORD),
+                        ("TargetName", wintypes.LPWSTR),
+                        ("Comment", wintypes.LPWSTR),
+                        ("LastWritten", wintypes.FILETIME),
+                        ("CredentialBlobSize", wintypes.DWORD),
+                        ("CredentialBlob",
+                         ctypes.POINTER(ctypes.c_ubyte)),
+                        ("Persist", wintypes.DWORD),
+                        ("AttributeCount", wintypes.DWORD),
+                        ("Attributes", ctypes.c_void_p),
+                        ("TargetAlias", wintypes.LPWSTR),
+                        ("UserName", wintypes.LPWSTR)]
+        advapi = ctypes.windll.advapi32
+        n = wintypes.DWORD()
+        pp = ctypes.POINTER(ctypes.POINTER(CREDENTIAL))()
+        if advapi.CredEnumerateW("gh:*", 0, ctypes.byref(n),
+                                 ctypes.byref(pp)):
+            mejor, fecha = "", 0
+            for i in range(n.value):
+                c = pp[i].contents
+                blob = ctypes.string_at(c.CredentialBlob,
+                                        c.CredentialBlobSize)
+                tok = blob.decode("utf-8", "ignore").strip()
+                escrito = (c.LastWritten.dwHighDateTime << 32
+                           | c.LastWritten.dwLowDateTime)
+                if tok.startswith("gh") and escrito > fecha:
+                    mejor, fecha = tok, escrito
+            advapi.CredFree(pp)
+            return mejor
+    except Exception:
+        pass
+    return ""
+
+
+def _nube_archivos():
+    """Los 4 json que forman 'mis partituras' (sin settings global:
+    esa se queda en cada PC, que tiene teclado/pantalla distintos)."""
+    return [("autopiano_scores.json", SCORES_FILE),
+            ("autopiano_songsettings.json", SONG_SETTINGS_FILE),
+            ("autopiano_secciones.json", SECCIONES_FILE),
+            ("autopiano_colores.json", COLORES_FILE)]
+
+
+def _nube_gist(token):
+    """Busca el gist privado de la nube; lo crea si no existe.
+    Devuelve el id o ""."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{GITHUB_API}/gists", method="GET",
+            headers={"User-Agent": _WEB_UA,
+                     "Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=30) as gists:
+            lista = json.loads(gists.read().decode("utf-8", "replace"))
+        for g in lista if isinstance(lista, list) else []:
+            if g.get("description") == NUBE_GIST_NOMBRE:
+                return g.get("id", "")
+    except Exception:
+        return ""
+    cuerpo = {"description": NUBE_GIST_NOMBRE, "public": False,
+              "files": {"README.md": {"content":
+                       "Partituras de AutoPiano (respaldo automatico)."}}}
+    res = _github_api("gists", "POST", cuerpo, token)
+    return res.get("id", "") if isinstance(res, dict) else ""
+
+
+def nube_subir():
+    """Sube los json al gist privado. Devuelve "ok", "sin-token",
+    "sin-gist" o "error"."""
+    token = _gh_token()
+    if not token:
+        return "sin-token"
+    gid = _nube_gist(token)
+    if not gid:
+        return "sin-gist"
+    files = {}
+    for nombre, ruta in _nube_archivos():
+        try:
+            with open(ruta, "r", encoding="utf-8-sig") as f:
+                contenido = f.read()
+        except Exception:
+            contenido = json.dumps({}, ensure_ascii=False)
+        files[nombre] = {"content": contenido}
+    res = _github_api(f"gists/{gid}", "PATCH",
+                      {"files": files}, token)
+    return "ok" if res is not None else "error"
+
+
+def nube_bajar():
+    """Descarga los json del gist privado y los deja en la carpeta de la
+    app. Los actuales se guardan antes con sufijo .pre-nube-FECHA (por si
+    querés volver atrás). Devuelve "ok", "sin-token", "sin-gist",
+    "vacio" o "error"."""
+    token = _gh_token()
+    if not token:
+        return "sin-token"
+    gid = _nube_gist(token)
+    if not gid:
+        return "sin-gist"
+    datos = _github_api(f"gists/{gid}", "GET", None, token)
+    if not isinstance(datos, dict):
+        return "error"
+    archivos = datos.get("files") or {}
+    bajados = 0
+    fecha = time.strftime("%Y%m%d")
+    for nombre, ruta in _nube_archivos():
+        info = archivos.get(nombre)
+        contenido = (info or {}).get("content")
+        if not isinstance(contenido, str):
+            continue
+        try:
+            if os.path.exists(ruta):
+                shutil.copyfile(ruta, f"{ruta}.pre-nube-{fecha}")
+        except Exception:
+            pass
+        try:
+            json.loads(contenido)          # sólo json válidos
+            with open(ruta, "w", encoding="utf-8") as f:
+                f.write(contenido)
+            bajados += 1
+        except Exception:
+            continue
+    if not bajados:
+        return "vacio"
+    # secciones y colores viven en memoria: recargar
+    return "ok"
+
+
+def comunidad_listar():
+    """Lista las partituras compartidas en la carpeta del repo.
+    Devuelve [(nombre, download_url)] o [] (sin red/error)."""
+    res = _github_api(f"repos/{COMUNIDAD_REPO}/contents/{COMUNIDAD_DIR}")
+    if not isinstance(res, list):
+        return []
+    out = []
+    for item in res:
+        if (isinstance(item, dict) and item.get("type") == "file"
+                and item.get("name", "").lower().endswith(".txt")):
+            out.append((item["name"], item.get("download_url") or ""))
+    out.sort()
+    return out
+
+
+def comunidad_leer(download_url):
+    """Descarga una partitura de la comunidad (texto plano). "" si falla."""
+    if not download_url:
+        return ""
+    try:
+        return _web_http_get(download_url, timeout=20)
+    except Exception:
+        return ""
+
+
+def comunidad_subir(nombre, texto):
+    """Sube una partitura a la carpeta del repo (dueño de la cuenta).
+    Devuelve "ok", "sin-token" o "error"."""
+    import base64
+    token = _gh_token()
+    if not token:
+        return "sin-token"
+    if not nombre.lower().endswith(".txt"):
+        nombre += ".txt"
+    nombre = "".join(ch for ch in nombre
+                     if ch.isalnum() or ch in " ._-()áéíóúÁÉÍÓÚñÑ")
+    ruta = f"repos/{COMUNIDAD_REPO}/contents/{COMUNIDAD_DIR}/{nombre}"
+    cuerpo = {"message": f"Partitura de la comunidad: {nombre}",
+              "content": base64.b64encode(
+                  texto.encode("utf-8")).decode("ascii")}
+    previo = _github_api(ruta)         # ¿ya existe? -> hace falta el sha
+    if isinstance(previo, dict) and previo.get("sha"):
+        cuerpo["sha"] = previo["sha"]
+    res = _github_api(ruta, "PUT", cuerpo, token)
+    return "ok" if isinstance(res, dict) else "error"
+
+
 def _web_buscar(query: str, limite: int = 8):
     """Busca la consulta en DuckDuckGo (versión HTML, sin API ni clave)
     y devuelve una lista de URLs de resultados."""
@@ -1134,7 +1365,7 @@ def _posicion_mouse():
 
 
 class AutoPianoApp:
-    VERSION = "4.22"   # bump al hacer cambios: se ve en el título de la ventana
+    VERSION = "4.23"   # bump al hacer cambios: se ve en el título de la ventana
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1167,6 +1398,11 @@ class AutoPianoApp:
         self._held = {}        # TECLA FÍSICA presionada -> timer de auto-liberación
         self._shift_timer = None   # timer que suelta el toque de Shift
         self._shift_down = False   # el Shift está presionado ahora mismo
+        # --- v4.23: tramo A→B para repetir la parte difícil -------------
+        self._marca_a = None       # índice del grupo donde empieza el tramo
+        self._marca_b = None       # índice del grupo donde termina
+        # --- v4.23: récords por canción y racha de días ----------------
+        self.records = {}          # {cancion: {tocadas, mejor_vel}}
 
         # --- variables de control ----------------------------------------
         self.speed_var = tk.DoubleVar(value=1.0)
@@ -1245,6 +1481,7 @@ class AutoPianoApp:
         self.scores = self._load_scores()
         self._cargar_secciones()     # secciones (carpetas) de canciones
         self._cargar_colores()       # paleta de colores personalizada
+        self._cargar_records()       # v4.23: récords y racha
         self._build_ui()
         # si es una instalación/actualización en carpeta nueva, ofrecer
         # importar las partituras de una versión anterior (con su config)
@@ -1427,6 +1664,15 @@ class AutoPianoApp:
         tk.Button(btns, text="🌐 Buscar notas en la web",
                   command=self._buscar_notas_dialog,
                   bg="#2f6b5a", fg="white", relief="flat", padx=8,
+                  font=("Segoe UI", 10, "bold")).pack(fill="x", pady=2)
+        tk.Button(btns, text="📈 Récords", command=self._records_dialog,
+                  bg="#6b4a2b", fg="white", relief="flat", padx=8,
+                  font=("Segoe UI", 10, "bold")).pack(fill="x", pady=2)
+        tk.Button(btns, text="🌍 Comunidad", command=self._comunidad_dialog,
+                  bg="#2f5a6b", fg="white", relief="flat", padx=8,
+                  font=("Segoe UI", 10, "bold")).pack(fill="x", pady=2)
+        tk.Button(btns, text="☁️ Mi nube", command=self._nube_dialog,
+                  bg="#4a4a8a", fg="white", relief="flat", padx=8,
                   font=("Segoe UI", 10, "bold")).pack(fill="x", pady=2)
         tk.Button(btns, text="📤 Exportar a .txt", command=self._export_txt,
                   bg="#555555", fg="white", relief="flat").pack(fill="x", pady=2)
@@ -1666,6 +1912,34 @@ class AutoPianoApp:
                                   font=("Segoe UI", 10, "bold"),
                                   relief="flat", pady=5, state="disabled")
         self.btn_stop.pack(fill="x", pady=2)
+
+        # --- v4.23: tramo A→B (repetir la parte difícil) ---------------
+        marcos = tk.Frame(inner, bg="#2b2b2b")
+        marcos.pack(fill="x", pady=(6, 2))
+        self.btn_marca_a = tk.Button(
+            marcos, text="📍A", command=lambda: self._marcar_tramo("A"),
+            bg="#3d5a80", fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=6, pady=3)
+        self.btn_marca_a.pack(side="left", expand=True, fill="x",
+                              padx=(0, 2))
+        self.btn_marca_b = tk.Button(
+            marcos, text="📍B", command=lambda: self._marcar_tramo("B"),
+            bg="#3d5a80", fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=6, pady=3)
+        self.btn_marca_b.pack(side="left", expand=True, fill="x",
+                              padx=(0, 2))
+        self.btn_marca_x = tk.Button(
+            marcos, text="✖", command=self._limpiar_tramo,
+            bg="#555555", fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=8, pady=3)
+        self.btn_marca_x.pack(side="left")
+        self.lbl_tramo = tk.Label(inner, text="Tramo: —", bg="#2b2b2b",
+                                  fg="#888888", font=("Segoe UI", 9))
+        self.lbl_tramo.pack(anchor="w")
+        tk.Label(inner, text="📍A empieza / 📍B termina: la canción repite\n"
+                             "ese tramo en bucle hasta que aprietes ✖ o ⏹.",
+                 bg="#2b2b2b", fg="#777777", font=("Segoe UI", 8),
+                 wraplength=230, justify="left").pack(anchor="w")
 
         self.lbl_estado = tk.Label(inner, text="Listo", bg="#2b2b2b", fg="#9fe870",
                                    font=("Segoe UI", 10, "bold"), wraplength=220)
@@ -2289,6 +2563,7 @@ class AutoPianoApp:
         if self.playing:
             self.stop_play()
         self._score_actual = name
+        self._limpiar_tramo_al_cambiar()   # v4.23: el tramo era de la otra
         self._set_board_text(self.scores[name])
         # config personalizada de ESTA canción (si tiene)
         self._aplicar_song_overrides(name)
@@ -3612,6 +3887,126 @@ class AutoPianoApp:
     # ======================================================================
     # Reproducción
     # ======================================================================
+    # ======================================================================
+    # v4.23 — Tramo A→B: repetir la parte difícil en bucle
+    # ======================================================================
+    def _tramo(self):
+        """(a, b) del tramo marcado y válido, o (None, None)."""
+        a, b = self._marca_a, self._marca_b
+        if a is None or b is None:
+            return None, None
+        if b < a:
+            a, b = b, a              # si marcó al revés, se ordena solo
+        return a, b
+
+    def _marcar_tramo(self, cual):
+        """📍A / 📍B: marca el inicio o el fin del tramo a repetir. Si está
+        sonando, toca el grupo actual; si no, la posición del cursor."""
+        if not self.groups:
+            messagebox.showinfo("Tramo A→B",
+                                "No hay notas en el pizarrón todavía.")
+            return
+        pos = self.pos if self.playing else self._cursor_group_pos()
+        pos = min(max(pos, 0), len(self.groups) - 1)
+        if cual == "A":
+            self._marca_a = pos
+        else:
+            self._marca_b = pos
+        a, b = self._tramo()
+        if a is None:
+            self.lbl_tramo.config(text="Tramo: —", fg="#888888")
+        elif a == b:
+            self.lbl_tramo.config(
+                text="Tramo: 1 nota (repite sola)", fg="#ff9f6b")
+        else:
+            self.lbl_tramo.config(
+                text=f"Tramo: notas {a + 1} → {b + 1} (en bucle)",
+                fg="#ff9f6b")
+        if a is not None and b is not None and a != b:
+            self.lbl_estado.config(text=f"🔁 Tramo A→B: notas {a + 1}–{b + 1}")
+
+    def _limpiar_tramo(self):
+        """✖: quita los marcadores A/B (vuelve a tocar la canción entera)."""
+        self._marca_a = None
+        self._marca_b = None
+        self.lbl_tramo.config(text="Tramo: —", fg="#888888")
+        if not self.playing:
+            self.lbl_estado.config(text="Listo")
+
+    def _limpiar_tramo_al_cambiar(self):
+        """Se usa al cambiar de canción: los marcadores no aplican."""
+        if self._marca_a is not None or self._marca_b is not None:
+            self._limpiar_tramo()
+
+    # ======================================================================
+    # v4.23 — 📈 Récords por canción y racha de días
+    # ======================================================================
+    def _cargar_records(self):
+        """Carga autopiano_records.json: {canciones: {nombre: {tocadas,
+        completadas, mejor_vel}}, racha: {ultimo_dia, dias}}."""
+        self.records = {"canciones": {}, "racha": {"ultimo_dia": "", "dias": 0}}
+        if os.path.exists(RECORDS_FILE):
+            try:
+                with open(RECORDS_FILE, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    canc = data.get("canciones")
+                    if isinstance(canc, dict):
+                        self.records["canciones"] = {
+                            k: v for k, v in canc.items()
+                            if isinstance(v, dict)}
+                    racha = data.get("racha")
+                    if isinstance(racha, dict):
+                        self.records["racha"] = {
+                            "ultimo_dia": str(racha.get("ultimo_dia", "")),
+                            "dias": int(racha.get("dias", 0) or 0)}
+            except Exception:
+                pass
+
+    def _guardar_records(self):
+        try:
+            _escribe_json(RECORDS_FILE, self.records)
+        except Exception:
+            pass
+
+    def _registrar_toco(self):
+        """Al apretar ▶: +1 tocadas a la canción actual y actualiza la
+        racha de días seguidos (hoy / ayer / se rompió)."""
+        name = self._score_actual or "—"
+        canc = self.records.setdefault("canciones", {})
+        fila = canc.setdefault(name, {"tocadas": 0, "completadas": 0,
+                                      "mejor_vel": 0.0})
+        fila["tocadas"] = int(fila.get("tocadas", 0)) + 1
+        hoy = time.strftime("%Y-%m-%d")
+        racha = self.records.setdefault(
+            "racha", {"ultimo_dia": "", "dias": 0})
+        ayer = time.strftime("%Y-%m-%d",
+                             time.localtime(time.time() - 86400))
+        if racha.get("ultimo_dia") == hoy:
+            pass                         # ya contó hoy
+        elif racha.get("ultimo_dia") == ayer:
+            racha["dias"] = int(racha.get("dias", 0) or 0) + 1
+        else:
+            racha["dias"] = 1             # primer día (o se cortó la racha)
+        racha["ultimo_dia"] = hoy
+        self._guardar_records()
+
+    def _registrar_exito(self):
+        """Al terminar la canción bien: +1 completadas y guarda la mayor
+        velocidad a la que se logró."""
+        name = self._score_actual or "—"
+        canc = self.records.setdefault("canciones", {})
+        fila = canc.setdefault(name, {"tocadas": 0, "completadas": 0,
+                                      "mejor_vel": 0.0})
+        fila["completadas"] = int(fila.get("completadas", 0)) + 1
+        try:
+            vel = float(self.speed)
+        except (ValueError, tk.TclError):
+            vel = 0.0
+        if vel > float(fila.get("mejor_vel", 0) or 0):
+            fila["mejor_vel"] = round(vel, 2)
+        self._guardar_records()
+
     def start_play(self):
         if self.playing:
             return
@@ -3632,6 +4027,7 @@ class AutoPianoApp:
         self.playing = True
         self.paused = False
         self.stop_flag = False
+        self._registrar_toco()        # v4.23: récords (tocadas + racha)
         self._release_all_held()      # limpiar teclas de una sesión anterior
         self._update_progress()
         self.btn_play.config(state="disabled")
@@ -3672,6 +4068,13 @@ class AutoPianoApp:
                          text=f"▶ Reproduciendo (vuelta {vuelta})"
                               if vuelta > 1 else "▶ Reproduciendo")
                 while self.pos < total:
+                    # --- v4.23: tramo A→B: pasó el fin -> vuelve al A ----
+                    a, b = self._tramo()
+                    if a is not None and self.pos > b:
+                        self.pos = a
+                        vuelta += 1
+                        self._ui(self.lbl_estado.config,
+                                 text=f"🔁 Tramo A→B (vuelta {vuelta})")
                     while self.paused and not self.stop_flag:
                         time.sleep(0.05)
                     if self.stop_flag:
@@ -3724,10 +4127,20 @@ class AutoPianoApp:
                         time.sleep(max(gap, 0.02))
 
                 # --- ¿terminó, repite o cambia de canción? ------------------
+                # v4.23: si el tramo A→B llega al fin de la canción (B en la
+                # última nota), el bucle interno salió sin saltar: acá vuelve.
+                a, b = self._tramo()
+                if not self.stop_flag and a is not None and self.pos > b:
+                    self.pos = a
+                    vuelta += 1
+                    self._ui(self.lbl_estado.config,
+                             text=f"🔁 Tramo A→B (vuelta {vuelta})")
+                    continue
                 if self.stop_flag:
                     break
                 if not self.loop_repeats and not self.rotate_songs:
                     termino_ok = True
+                    self._ui(self._registrar_exito)   # v4.23: récord
                     self._ui(self.lbl_estado.config, text="✔ Terminado")
                     break
                 vuelta += 1
@@ -3786,6 +4199,7 @@ class AutoPianoApp:
             if texto is None:
                 return
             self._score_actual = name
+            self._limpiar_tramo_al_cambiar()   # v4.23: tramo de otra canción
             self._set_board_text(texto)
             self.board.config(state="disabled")
             self._tag_groups(self.board.get("1.0", "end-1c"))
@@ -4686,6 +5100,329 @@ class AutoPianoApp:
 
         btn_buscar.config(command=buscar)
         query.focus_set()
+
+    # ======================================================================
+    # v4.23 — Diálogos: 📈 Récords, ☁️ Mi nube, 🌍 Comunidad
+    # ======================================================================
+    def _records_dialog(self):
+        """📈 Récords por canción: cuántas veces la tocaste, cuántas la
+        terminaste bien, la mayor velocidad lograda y la racha de días."""
+        win = tk.Toplevel(self.root)
+        win.title("📈 Récords y racha")
+        win.geometry("520x520")
+        win.configure(bg="#2b2b2b")
+        win.grab_set()
+
+        racha = self.records.get("racha", {})
+        tk.Label(win, text="📈 Récords y racha", bg="#2b2b2b", fg="white",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=12,
+                                                     pady=(12, 2))
+        tk.Label(win,
+                 text=f"🔥 Racha: {int(racha.get('dias', 0) or 0)} día(s) "
+                      f"seguidos tocando\n(toqué hoy para mantenerla)",
+                 bg="#2b2b2b", fg="#ff9f6b", font=("Segoe UI", 11),
+                 justify="left").pack(anchor="w", padx=12)
+
+        marco = tk.Frame(win, bg="#1e1e1e")
+        marco.pack(fill="both", expand=True, padx=12, pady=8)
+        cols = ("Canción", "Tocadas", "OK", "Máx. vel")
+        tree = ttk.Treeview(marco, columns=cols, show="headings",
+                            height=14)
+        for c, w in zip(cols, (230, 70, 55, 80)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w")
+        scroll = ttk.Scrollbar(marco, orient="vertical",
+                               command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        canc = self.records.get("canciones", {})
+
+        def refrescar():
+            tree.delete(*tree.get_children())
+            for nombre in sorted(canc):
+                fila = canc[nombre] if isinstance(canc[nombre], dict) else {}
+                tree.insert("", "end", values=(
+                    nombre,
+                    int(fila.get("tocadas", 0) or 0),
+                    int(fila.get("completadas", 0) or 0),
+                    f"{float(fila.get('mejor_vel', 0) or 0):.2f}x"))
+        refrescar()
+
+        def abrir(_evt=None):
+            sel = tree.selection()
+            if sel and sel[0] in self.scores:
+                self.listbox.selection_clear(0, "end")
+                try:
+                    idx = list(self.scores.keys()).index(sel[0])
+                    self.listbox.selection_set(idx)
+                except (ValueError, tk.TclError):
+                    pass
+                self._on_select_score()
+                win.destroy()
+
+        tree.bind("<Double-1>", abrir)
+
+        fila = tk.Frame(win, bg="#2b2b2b")
+        fila.pack(fill="x", padx=12, pady=(0, 12))
+        tk.Button(fila, text="Abrir canción (doble clic)",
+                  command=abrir, bg="#3a5a7d", fg="white",
+                  relief="flat").pack(side="left")
+        tk.Button(fila, text="Cerrar", command=win.destroy,
+                  bg="#555555", fg="white", relief="flat"
+                  ).pack(side="right")
+
+    def _nube_dialog(self):
+        """☁️ Mi nube: respaldo/restore de mis partituras en un lugar
+        privado de mi cuenta de GitHub (gist)."""
+        win = tk.Toplevel(self.root)
+        win.title("☁️ Mi nube de partituras")
+        win.geometry("560x470")
+        win.configure(bg="#2b2b2b")
+        win.grab_set()
+
+        tk.Label(win, text="☁️ Mi nube de partituras", bg="#2b2b2b",
+                 fg="white", font=("Segoe UI", 14, "bold")
+                 ).pack(anchor="w", padx=12, pady=(12, 2))
+        info = tk.Label(
+            win, justify="left", bg="#2b2b2b", fg="#cccccc",
+            font=("Segoe UI", 10),
+            text="Guardá tus partituras y ajustes en un lugar PRIVADO de\n"
+                 "tu cuenta de GitHub. En otra PC con AutoPiano, entrás a\n"
+                 "esta misma pantalla y das ▼ Restaurar: tenés todo al\n"
+                 "instante. Nunca se borra nada solo.")
+        info.pack(anchor="w", padx=12)
+
+        tiene_token = bool(_gh_token())
+        estado = tk.Label(
+            win,
+            text=("✔ Cuenta detectada: se puede usar la nube"
+                  if tiene_token else
+                  "⚠ No se encontró tu cuenta de GitHub en esta PC.\n"
+                  "La nube usa el token de gh CLI (si iniciaste sesión)."),
+            bg="#2b2b2b", fg="#9fe870" if tiene_token else "#ffe066",
+            font=("Segoe UI", 10, "bold"), justify="left",
+            wraplength=520)
+        estado.pack(anchor="w", padx=12, pady=8)
+
+        log = tk.Text(win, height=10, bg="#1e1e1e", fg="#e8e8e8",
+                      font=("Consolas", 10), state="disabled",
+                      wrap="word")
+        log.pack(fill="both", expand=True, padx=12, pady=4)
+
+        def decir(txt, color="#e8e8e8"):
+            log.config(state="normal")
+            log.insert("end", txt + "\n")
+            log.tag_add("c", "end-2c", "end-1c")
+            log.tag_config("c", foreground=color)
+            log.see("end")
+            log.config(state="disabled")
+
+        def en_hilo(fn, etiqueta):
+            btns.config(state="disabled")
+            decir(f"⏳ {etiqueta}…", "#ffe066")
+
+            def worker():
+                try:
+                    res = fn()
+                except Exception as e:
+                    res = f"error: {e}"
+
+                def done(res=res):
+                    mensajes = {
+                        "ok": ("✔ Listo", "#9fe870"),
+                        "sin-token": ("✖ No encontré tu token de GitHub "
+                                      "en esta PC.", "#ffd7d7"),
+                        "sin-gist": ("✖ No pude crear/abrir el respaldo "
+                                     "en la nube.", "#ffd7d7"),
+                        "vacio": ("⚠ El respaldo de la nube está vacío "
+                                  "(nada que restaurar).", "#ffe066"),
+                        "error": ("✖ Error de red o de GitHub. Revisá tu "
+                                  "internet.", "#ffd7d7"),
+                    }
+                    texto, color = mensajes.get(
+                        res, (f"Resultado: {res}", "#e8e8e8"))
+                    decir(texto, color)
+                    if res == "ok" and etiqueta.startswith("Bajar"):
+                        decir("🔄 Cerrá y volvé a abrir la app para ver "
+                              "las partituras restauradas.", "#ffe066")
+                    btns.config(state="normal")
+                self._ui(done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btns = tk.Frame(win, bg="#2b2b2b")
+        btns.pack(fill="x", padx=12, pady=8)
+        tk.Button(btns, text="⬆️ Subir mis partituras",
+                  command=lambda: en_hilo(nube_subir, "Subir"),
+                  bg="#3a7d44", fg="white", relief="flat",
+                  font=("Segoe UI", 11, "bold")).pack(
+                      side="left", expand=True, fill="x", padx=(0, 4))
+        tk.Button(btns, text="⬇️ Restaurar desde la nube",
+                  command=lambda: en_hilo(nube_bajar, "Bajar"),
+                  bg="#3d5a80", fg="white", relief="flat",
+                  font=("Segoe UI", 11, "bold")).pack(
+                      side="left", expand=True, fill="x", padx=(4, 0))
+
+        decir("Listo para usar." if tiene_token
+              else "La nube necesita que en esta PC hayas iniciado sesión "
+                   "con gh CLI (una sola vez).")
+
+    def _comunidad_dialog(self):
+        """🌍 Canciones de la comunidad: catálogo compartido en el repo
+        oficial — bajar las de otros o subir las tuyas."""
+        win = tk.Toplevel(self.root)
+        win.title("🌍 Canciones de la comunidad")
+        win.geometry("640x560")
+        win.configure(bg="#2b2b2b")
+        win.grab_set()
+
+        tk.Label(win, text="🌍 Canciones de la comunidad", bg="#2b2b2b",
+                 fg="white", font=("Segoe UI", 14, "bold")
+                 ).pack(anchor="w", padx=12, pady=(12, 2))
+        status = tk.Label(win, text="⏳ Cargando el catálogo…",
+                          bg="#2b2b2b", fg="#ffe066",
+                          font=("Segoe UI", 10, "bold"))
+        status.pack(anchor="w", padx=12)
+
+        lista = []           # [(nombre, download_url)]
+
+        listbox = tk.Listbox(win, height=12, bg="#1e1e1e", fg="#e8e8e8",
+                             selectbackground="#4a6da7",
+                             exportselection=False,
+                             font=("Segoe UI", 11))
+        listbox.pack(fill="x", padx=12, pady=4)
+
+        preview = tk.Text(win, height=8, bg="#1e1e1e", fg="#e8e8e8",
+                          font=("Consolas", 11), state="disabled",
+                          wrap="word")
+        preview.pack(fill="both", expand=True, padx=12, pady=4)
+
+        def ver(_evt=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            nombre, url = lista[sel[0]]
+            status.config(text=f"⏳ Descargando '{nombre}'…", fg="#ffe066")
+
+            def worker(nombre=nombre, url=url):
+                texto = comunidad_leer(url)
+
+                def done(texto=texto):
+                    preview.config(state="normal")
+                    preview.delete("1.0", "end")
+                    preview.insert("1.0", texto or "(no se pudo descargar)")
+                    preview.config(state="disabled")
+                    if texto:
+                        status.config(
+                            text=f"✔ '{nombre}' — la podés guardar con "
+                                 f"⬇️ Guardar en mi lista",
+                            fg="#9fe870")
+                    else:
+                        status.config(text=f"✖ No se pudo descargar "
+                                           f"'{nombre}'.", fg="#ffd7d7")
+                self._ui(done)
+            threading.Thread(target=worker, daemon=True).start()
+
+        listbox.bind("<<ListboxSelect>>", ver)
+
+        def guardar():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showinfo("Comunidad", "Elegí una canción "
+                                    "de la lista.", parent=win)
+                return
+            cuerpo = preview.get("1.0", "end").strip()
+            if not cuerpo or cuerpo.startswith("(no se pudo"):
+                return
+            nombre = lista[sel[0]][0].rsplit(".", 1)[0]
+            base, i = nombre, 2
+            while nombre in self.scores:
+                nombre = f"{base} ({i})"
+                i += 1
+            self.scores[nombre] = cuerpo
+            self._score_actual = nombre
+            self._asignar_seccion_nueva(nombre)
+            self._save_scores()
+            self._refresh_list(keep=nombre)
+            status.config(text=f"💾 '{nombre}' guardada en tu lista",
+                          fg="#9fe870")
+
+        def subir():
+            actual = self._current_score_name()
+            if not actual:
+                messagebox.showinfo("Comunidad", "Elegí primero una "
+                                    "canción TUYA en la lista de la app.",
+                                    parent=win)
+                return
+            if not messagebox.askyesno(
+                    "Comunidad",
+                    f"¿Subir '{actual}' a la carpeta pública de la "
+                    f"comunidad?\n\nTodos podrán verla y bajarla con tu "
+                    f"nombre de usuario.", parent=win):
+                return
+            status.config(text=f"⏳ Subiendo '{actual}'…", fg="#ffe066")
+            texto = self.scores.get(actual, "")
+
+            def worker(actual=actual, texto=texto):
+                res = comunidad_subir(actual, texto)
+
+                def done(res=res):
+                    mensajes = {"ok": "✔ ¡Subida! Ya está en el catálogo "
+                                      "de la comunidad.",
+                                "sin-token": "✖ Sin token de GitHub en "
+                                             "esta PC (sólo el dueño del "
+                                             "repo puede subir).",
+                                "error": "✖ No se pudo subir (red o "
+                                         "permisos)."}
+                    color = "#9fe870" if res == "ok" else "#ffd7d7"
+                    status.config(text=mensajes.get(res, f"Resultado: {res}"),
+                                  fg=color)
+                    if res == "ok":
+                        cargar()
+                self._ui(done)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def cargar():
+            status.config(text="⏳ Cargando el catálogo…", fg="#ffe066")
+
+            def worker():
+                try:
+                    res = comunidad_listar()
+                except Exception:
+                    res = []
+
+                def done(res=res):
+                    lista[:] = res
+                    listbox.delete(0, "end")
+                    for nombre, _url in res:
+                        listbox.insert("end", nombre)
+                    if res:
+                        status.config(
+                            text=f"✔ {len(res)} canción(es) en el "
+                                 f"catálogo. Elegí una para verla.",
+                            fg="#9fe870")
+                    else:
+                        status.config(
+                            text="✖ El catálogo está vacío o no hay "
+                                 "internet.", fg="#ffe066")
+                self._ui(done)
+            threading.Thread(target=worker, daemon=True).start()
+
+        fila = tk.Frame(win, bg="#2b2b2b")
+        fila.pack(fill="x", padx=12, pady=(4, 12))
+        tk.Button(fila, text="🔄 Actualizar", command=cargar,
+                  bg="#555555", fg="white", relief="flat").pack(side="left")
+        tk.Button(fila, text="⬇️ Guardar en mi lista", command=guardar,
+                  bg="#3a7d44", fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold")).pack(side="right",
+                                                      padx=6)
+        tk.Button(fila, text="📤 Subir la mía", command=subir,
+                  bg="#6b4a2b", fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        cargar()
 
     # ======================================================================
     # Exportar a .txt / respaldo / eliminar
