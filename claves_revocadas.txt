@@ -1,0 +1,2 @@
+# AutoPiano - claves revocadas (una por linea, sin importar mayusculas)
+# El usuario final nunca ve esto: la app la consulta una sola vez al activar.
