@@ -68,6 +68,15 @@ SECCIONES_FILE = os.path.join(_APP_DIR, "autopiano_secciones.json")
 COLORES_FILE = os.path.join(_APP_DIR, "autopiano_colores.json")
 RECORDS_FILE = os.path.join(_APP_DIR, "autopiano_records.json")
 CUENTA_FILE = os.path.join(_APP_DIR, "autopiano_cuenta.json")
+ACTIVACION_FILE = os.path.join(_APP_DIR, "autopiano_activacion.json")
+
+# Claves de activación (v4.24): prefijo + 16 caracteres Crockford
+CLAVE_PREFIJO = "AP4"
+_CLAVE_ALF = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # sin I, L, O, U (confusos)
+_CLAVE_SECRETO_B64 = "jYoGlYJDZOZehlX1VyOJhmweeko="   # ofuscado (xor 0x5A)
+TIPOS_CLAVE = {1: ("semanal", 7), 2: ("mensual", 30),
+               3: ("anual", 365), 4: ("permanente", 0)}
+TIPOS_CLAVE_N = {v[0]: k for k, v in TIPOS_CLAVE.items()}
 
 # Paleta de la interfaz: el usuario puede cambiar cada uno (código hex
 # tipo #ffffff o con las barras RGB). Se guarda en autopiano_colores.json
@@ -1263,6 +1272,288 @@ def comunidad_subir(nombre, texto):
     return "ok" if isinstance(res, dict) else "error"
 
 
+# ======================================================================
+# v4.24 — 🗝 Claves de activación (semanal / mensual / anual / permanente)
+# ======================================================================
+CLAVES_REPO = "rexzetaop/autopiano-roblox"   # donde vive claves_revocadas.txt
+
+
+def _clave_secreto():
+    """Secreto de firmado (ofuscado con xor 0x5A en la constante)."""
+    import base64
+    return bytes(b ^ 0x5A for b in base64.b64decode(_CLAVE_SECRETO_B64))
+
+
+def _clave_mac(datos):
+    """Firma HMAC-SHA256 de los primeros 6 bytes, recortada a 4."""
+    import hashlib
+    import hmac
+    return hmac.new(_clave_secreto(), datos, hashlib.sha256).digest()[:4]
+
+
+def _crock_enc(datos: bytes) -> str:
+    """Base32 Crockford: 10 bytes -> exactamente 16 caracteres."""
+    bits = int.from_bytes(datos, "big")
+    total = len(datos) * 8
+    out = []
+    for i in range(total // 5):
+        out.append(_CLAVE_ALF[(bits >> (total - 5 * (i + 1))) & 31])
+    return "".join(out)
+
+
+def _crock_dec(texto: str) -> bytes:
+    """Inversa de _crock_enc; lanza ValueError con caracteres raros."""
+    if len(texto) % 8 == 0 and texto.endswith("="):
+        texto = texto.rstrip("=")
+    val = 0
+    for ch in texto:
+        i = _CLAVE_ALF.find(ch)
+        if i < 0:
+            raise ValueError("caracter invalido")
+        val = (val << 5) | i
+    bits = len(texto) * 5
+    return val.to_bytes(bits // 8, "big") if bits % 8 == 0 else \
+        val.to_bytes(bits // 8 + 1, "big")[1:]
+
+
+def clave_normalizar(texto):
+    """Mayúsculas, sin símbolos, y con las confusiones usuales resueltas
+    (O→0, I/L→1: esos símbolos no existen en el alfabeto de la clave)."""
+    import re
+    t = re.sub(r"[^0-9A-Za-z]", "", (texto or "")).upper()
+    return t.replace("O", "0").replace("I", "1").replace("L", "1")
+
+
+def clave_generar(tipo):
+    """Crea una clave nueva firmada. tipo: nombre ('semanal', 'mensual',
+    'anual', 'permanente') o número 1-4. El reloj arranca al ACTIVAR."""
+    import os as _os
+    if isinstance(tipo, str):
+        tipo = TIPOS_CLAVE_N.get(tipo.lower().strip())
+    tipo = int(tipo) if tipo else 0
+    if tipo not in TIPOS_CLAVE:
+        raise ValueError("tipo de clave invalido: usa semanal, mensual, "
+                         "anual o permanente")
+    cuerpo = bytes([1, tipo]) + _os.urandom(4)
+    return (CLAVE_PREFIJO + "-"
+            + "-".join(_crock_enc(cuerpo + _clave_mac(cuerpo))[i:i + 4]
+                       for i in range(0, 16, 4)))
+
+
+def clave_validar(texto):
+    """(ok, motivo, info). motivo: '', 'formato', 'falsificada',
+    'desconocida' o 'vencida'. info: {'tipo','dias'}."""
+    t = clave_normalizar(texto)
+    if not t.startswith(CLAVE_PREFIJO):
+        return False, "formato", {}
+    cuerpo = t[len(CLAVE_PREFIJO):]
+    if len(cuerpo) != 16:
+        return False, "formato", {}
+    try:
+        datos = _crock_dec(cuerpo)
+    except (ValueError, OverflowError):
+        return False, "formato", {}
+    if len(datos) != 10 or datos[0] != 1:
+        return False, "formato", {}
+    if _clave_mac(datos[:6]) != datos[6:]:
+        return False, "falsificada", {}
+    tipo = datos[1]
+    if tipo not in TIPOS_CLAVE:
+        return False, "desconocida", {}
+    nombre, dias = TIPOS_CLAVE[tipo]
+    return True, "", {"tipo": nombre, "dias": dias}
+
+
+def _clave_revocada(norm):
+    """¿Está la clave en claves_revocadas.txt del repo? True / False /
+    None si no se pudo consultar (sin internet)."""
+    url = (f"https://raw.githubusercontent.com/{CLAVES_REPO}/main/"
+           f"claves_revocadas.txt")
+    try:
+        texto = _web_http_get(url, timeout=8)
+    except Exception:
+        return None
+    # cuerpo = clave sin el prefijo AP4, para comparar en la misma base
+    cuerpo = (norm[len(CLAVE_PREFIJO):]
+              if norm.startswith(CLAVE_PREFIJO) else norm)
+    for linea in texto.splitlines():
+        l = clave_normalizar(linea.split("#")[0])
+        if l.startswith(CLAVE_PREFIJO):
+            l = l[len(CLAVE_PREFIJO):]
+        # prefijo >= 8: revocar un lote sin matar claves de otros tipos
+        if len(l) >= 8 and (cuerpo == l or cuerpo.startswith(l)):
+            return True
+    return False
+
+
+def activar_clave(texto):
+    """Valida la clave (firma + revocación por internet UNA sola vez) y
+    guarda la activación local. Devuelve (ok, motivo)."""
+    ok, motivo, info = clave_validar(texto)
+    if not ok:
+        return False, motivo
+    norm = clave_normalizar(texto)
+    if _clave_revocada(norm) is True:
+        return False, "revocada"
+    import datetime
+    hoy = datetime.date.today()
+    vence = ""
+    if info["dias"]:
+        vence = (hoy + datetime.timedelta(days=info["dias"])).isoformat()
+    _escribe_json(ACTIVACION_FILE, {
+        "clave": norm, "tipo": info["tipo"], "dias": info["dias"],
+        "activada": hoy.isoformat(), "vence": vence})
+    return True, ""
+
+
+def _activacion_vigente():
+    """(ok, motivo, datos). motivo: '', 'sin-activar' o 'vencida'.
+    La clave permanente nunca vence; las demás comparan fecha local
+    (sin internet, como pediste: se valida una sola vez)."""
+    import datetime
+    if not os.path.exists(ACTIVACION_FILE):
+        return False, "sin-activar", {}
+    try:
+        with open(ACTIVACION_FILE, "r", encoding="utf-8-sig") as f:
+            datos = json.load(f)
+    except Exception:
+        return False, "sin-activar", {}
+    if not isinstance(datos, dict) or not datos.get("clave"):
+        return False, "sin-activar", {}
+    vence = str(datos.get("vence") or "")
+    if not vence:
+        return True, "", datos          # permanente
+    try:
+        v = datetime.date.fromisoformat(vence)
+    except Exception:
+        return False, "vencida", datos
+    if datetime.date.today() > v:
+        return False, "vencida", datos
+    return True, "", datos
+
+
+def _dialogo_activacion(root, motivo=""):
+    """Pantalla de activación (bloquea el uso hasta tener clave válida).
+    Devuelve True si quedó activada."""
+    import threading
+    win = tk.Toplevel(root)
+    win.title("Activar AutoPiano")
+    win.geometry("560x420")
+    win.configure(bg="#2b2b2b")
+    win.grab_set()
+    win.resizable(False, False)
+
+    tk.Label(win, text="🔑 Activar AutoPiano", bg="#2b2b2b", fg="white",
+             font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=18,
+                                                 pady=(18, 4))
+    if motivo == "vencida":
+        vence = ""
+        try:
+            with open(ACTIVACION_FILE, encoding="utf-8-sig") as f:
+                vence = json.load(f).get("vence", "")
+        except Exception:
+            pass
+        aviso, color = ((f"Tu clave venció el {vence}. "
+                         f"Pegá una nueva para seguir usando la app."
+                         if vence else
+                         "Tu clave venció. Pegá una nueva para seguir "
+                         "usando la app."), "#ff9f6b")
+    else:
+        aviso, color = ("Esta copia de AutoPiano no tiene una clave "
+                        "activa. Necesitás una clave para usarla.", "#ffe066")
+    tk.Label(win, text=aviso, bg="#2b2b2b", fg=color,
+             font=("Segoe UI", 11), wraplength=520, justify="left"
+             ).pack(anchor="w", padx=18)
+    tk.Label(win, text="Tipos de clave:  semanal (7 días) · mensual (30) ·\n"
+                       "anual (365) · permanente (no vence). El reloj\n"
+                       "empieza cuando la activás.",
+             bg="#2b2b2b", fg="#aaaaaa", font=("Segoe UI", 10),
+             justify="left").pack(anchor="w", padx=18, pady=(6, 0))
+
+    fila = tk.Frame(win, bg="#2b2b2b")
+    fila.pack(fill="x", padx=18, pady=(14, 0))
+    entrada = tk.Entry(fila, font=("Consolas", 13), justify="center")
+    entrada.pack(fill="x")
+    entrada.insert(0, CLAVE_PREFIJO + "-")
+    entrada.select_range(len(CLAVE_PREFIJO) + 1, "end")
+
+    estado = tk.Label(win, text="", bg="#2b2b2b", fg="#ffd7d7",
+                      font=("Segoe UI", 10, "bold"), wraplength=520,
+                      justify="left")
+    estado.pack(anchor="w", padx=18, pady=(10, 0))
+
+    resultado = {"ok": False}
+
+    def salir():
+        win.destroy()
+
+    def activar():
+        texto = entrada.get()
+        btn_act.config(state="disabled")
+        estado.config(text="⏳ Validando clave…", fg="#ffe066")
+        caja = {}                    # el hilo sólo deja el resultado acá
+
+        def worker():
+            try:
+                caja["res"] = activar_clave(texto)
+            except Exception as e:
+                caja["res"] = (False, f"error: {e}")
+
+        def done(res):
+            if res[0]:
+                resultado["ok"] = True
+                win.destroy()
+                return
+            motivos = {
+                "formato": "Esa clave no tiene el formato correcto.",
+                "falsificada": "Clave incorrecta o alterada.",
+                "desconocida": "Tipo de clave desconocido.",
+                "revocada": "Esta clave fue revocada por el creador.",
+            }
+            estado.config(
+                text=motivos.get(res[1], f"No se pudo activar: {res[1]}"),
+                fg="#ffd7d7")
+            btn_act.config(state="normal")
+            entrada.focus_set()
+            entrada.select_range(0, "end")
+
+        # OJO: root.after desde el HILO SECUNDARIO revienta con
+        # "main thread is not in main loop" mientras el hilo principal
+        # está en wait_window (y también ANTES de mainloop, que es
+        # justo cómo arranca el candado en main()). Así que el worker
+        # sólo escribe en "caja" y el hilo principal la vigila.
+        def vigilar(n=0):
+            if not win.winfo_exists():
+                return
+            if "res" in caja:
+                done(caja["res"])
+            elif n < 200:            # 100 ms x 200 = 20 s (la red tarda <= 8)
+                root.after(100, lambda: vigilar(n + 1))
+            else:
+                done((False, "error: sin respuesta"))
+
+        threading.Thread(target=worker, daemon=True).start()
+        root.after(100, vigilar)
+
+    btns = tk.Frame(win, bg="#2b2b2b")
+    btns.pack(fill="x", padx=18, pady=(16, 0))
+    btn_act = tk.Button(btns, text="✅ Activar", command=activar,
+                        bg="#3a7d44", fg="white", font=("Segoe UI", 12,
+                                                        "bold"),
+                        relief="flat", padx=14, pady=4)
+    btn_act.pack(side="left", expand=True, fill="x", padx=(0, 6))
+    tk.Button(btns, text="❌ Salir", command=salir, bg="#555555",
+              fg="white", font=("Segoe UI", 12), relief="flat",
+              padx=14, pady=4).pack(side="right", expand=True, fill="x",
+                                    padx=(6, 0))
+    entrada.bind("<Return>", lambda _e: activar())
+    win.protocol("WM_DELETE_WINDOW", salir)
+    entrada.focus_set()
+    entrada.select_range(len(CLAVE_PREFIJO) + 1, "end")
+    win.wait_window()
+    return resultado["ok"]
+
+
 def _web_buscar(query: str, limite: int = 8):
     """Busca la consulta en DuckDuckGo (versión HTML, sin API ni clave)
     y devuelve una lista de URLs de resultados."""
@@ -1365,7 +1656,7 @@ def _posicion_mouse():
 
 
 class AutoPianoApp:
-    VERSION = "4.23"   # bump al hacer cambios: se ve en el título de la ventana
+    VERSION = "4.24"   # bump al hacer cambios: se ve en el título de la ventana
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -5800,6 +6091,15 @@ class AutoPianoApp:
 
 def main():
     root = tk.Tk()
+    # 🗝 v4.24: sin clave vigente no se usa la app (se valida una sola
+    # vez al activar; después sólo cheques de fecha local).
+    ok, motivo, _ = _activacion_vigente()
+    if not ok:
+        root.withdraw()
+        if not _dialogo_activacion(root, motivo):
+            root.destroy()
+            return
+        root.deiconify()
     AutoPianoApp(root)
     root.mainloop()
 
