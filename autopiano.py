@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import wave
+import webbrowser
 import tkinter as tk
 from html import unescape as _html_unescape
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
@@ -75,8 +76,22 @@ CLAVE_PREFIJO = "AP4"
 _CLAVE_ALF = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # sin I, L, O, U (confusos)
 _CLAVE_SECRETO_B64 = "jYoGlYJDZOZehlX1VyOJhmweeko="   # ofuscado (xor 0x5A)
 TIPOS_CLAVE = {1: ("semanal", 7), 2: ("mensual", 30),
-               3: ("anual", 365), 4: ("permanente", 0)}
+               3: ("anual", 365), 4: ("permanente", 0),
+               5: ("diaria", 1)}
 TIPOS_CLAVE_N = {v[0]: k for k, v in TIPOS_CLAVE.items()}
+
+# Registro de claves usadas (v4.25): repo PRIVADO con un permiso acotado
+# embebido (sólo Contents: RW de ESE repo). Un solo uso por clave; las
+# permanentes NO se registran (exentas).
+REGISTRO_REPO = "rexzetaop/claves-usos"
+REGISTRO_ARCHIVO = "usadas.txt"
+_REG_TOKEN_B64 = ("PTMuMi84BSo7LgVraxkMChBtGRtqaAo3aC0dYm45AwIJBTEeNCkfKTlrYwojNSwVERk"
+                  "PDg5iMm84bw8DLxQLOz9iKwkRCWgqCChsKiIcEAICEx0MFAMOCzk2aA4w")  # xor 0x5A
+
+# Anuncio de la clave diaria (v4.25): link que pone el dueño;
+# "" = todavía no hay anuncio configurado.
+ANUNCIO_URL = ""
+ANUNCIO_ESPERA = 30       # segundos de cuenta regresiva para reclamar
 
 # Paleta de la interfaz: el usuario puede cambiar cada uno (código hex
 # tipo #ffffff o con las barras RGB). Se guarda en autopiano_colores.json
@@ -1326,14 +1341,15 @@ def clave_normalizar(texto):
 
 def clave_generar(tipo):
     """Crea una clave nueva firmada. tipo: nombre ('semanal', 'mensual',
-    'anual', 'permanente') o número 1-4. El reloj arranca al ACTIVAR."""
+    'anual', 'permanente', 'diaria') o número 1-5. El reloj arranca al
+    ACTIVAR (la diaria vence el mismo día)."""
     import os as _os
     if isinstance(tipo, str):
         tipo = TIPOS_CLAVE_N.get(tipo.lower().strip())
     tipo = int(tipo) if tipo else 0
     if tipo not in TIPOS_CLAVE:
         raise ValueError("tipo de clave invalido: usa semanal, mensual, "
-                         "anual o permanente")
+                         "anual, permanente o diaria")
     cuerpo = bytes([1, tipo]) + _os.urandom(4)
     return (CLAVE_PREFIJO + "-"
             + "-".join(_crock_enc(cuerpo + _clave_mac(cuerpo))[i:i + 4]
@@ -1386,23 +1402,146 @@ def _clave_revocada(norm):
     return False
 
 
+def _reg_token():
+    """PAT del registro (ofuscado xor 0x5A). '' si falta configurar."""
+    if not _REG_TOKEN_B64:
+        return ""
+    import base64
+    try:
+        return bytes(b ^ 0x5A for b in base64.b64decode(
+            _REG_TOKEN_B64.encode("ascii"))).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _reg_contiene(texto, norm):
+    """¿La clave normalizada está anotada en el texto del registro?
+    Ignora líneas vacías y comentarios (#)."""
+    for linea in (texto or "").splitlines():
+        cuerpo = clave_normalizar(linea.split("#")[0])
+        if cuerpo and cuerpo == norm:
+            return True
+    return False
+
+
+def _reg_leer():
+    """Lee usadas.txt del repo privado. (texto, '') o (None, motivo)
+    si no se pudo leer (sin token o sin internet)."""
+    token = _reg_token()
+    if not token:
+        return None, "sin-token"
+    res = _github_api(f"repos/{REGISTRO_REPO}/contents/{REGISTRO_ARCHIVO}",
+                      token=token)
+    if not isinstance(res, dict) or not isinstance(res.get("content"), str):
+        # Un 404 y un fallo de red se ven igual acá: por eso usadas.txt
+        # ya viene sembrado en el repo. Si no se pudo leer, no se concede
+        # el uso (mejor denegar de más que dejar pasar una clave gastada).
+        return None, "sin-internet"
+    import base64
+    try:
+        texto = base64.b64decode(res["content"]).decode("utf-8",
+                                                        errors="replace")
+    except Exception:
+        return None, "error"
+    return texto, ""
+
+
+def _reg_escribir(texto, token):
+    """Escribe usadas.txt completo (PUT con sha). 'ok' o 'error'.
+    Si el sha quedó viejo (otra PC escribió primero) reintenta una vez."""
+    import base64
+    ruta = f"repos/{REGISTRO_REPO}/contents/{REGISTRO_ARCHIVO}"
+    cuerpo = {"message": "Registro de claves usadas (AutoPiano)",
+              "content": base64.b64encode(texto.encode("utf-8")
+                                          ).decode("ascii")}
+    for _intento in range(2):
+        previo = _github_api(ruta, token=token)
+        if isinstance(previo, dict) and previo.get("sha"):
+            cuerpo["sha"] = previo["sha"]
+        res = _github_api(ruta, "PUT", cuerpo, token)
+        if isinstance(res, dict):
+            return "ok"
+        # casi siempre sha viejo: se vuelve a leer y se reintenta
+    return "error"
+
+
+def _reg_agregar(norm):
+    """Anota la clave como usada (un solo uso). Devuelve '' si quedó
+    anotada, 'usada' si ya estaba gastada o 'sin-internet' si no se
+    pudo verificar ni anotar (en ese caso NO se concede el uso)."""
+    token = _reg_token()
+    if not token:
+        return "sin-internet"
+    texto, _err = _reg_leer()
+    if texto is None:
+        return "sin-internet"
+    if _reg_contiene(texto, norm):
+        return "usada"
+    nuevo = texto
+    if nuevo and not nuevo.endswith("\n"):
+        nuevo += "\n"
+    nuevo += norm + "\n"
+    if _reg_escribir(nuevo, token) != "ok":
+        return "sin-internet"
+    return ""
+
+
+def _reg_quitar(norm):
+    """Borra la clave del registro (deshace un fallo posterior al
+    anotarla). True si quedó borrada; si falla se deja anotada
+    (mejor de más que de menos)."""
+    token = _reg_token()
+    if not token:
+        return False
+    texto, _err = _reg_leer()
+    if texto is None:
+        return False
+    nuevas, fuera = [], False
+    for linea in texto.splitlines():
+        if clave_normalizar(linea.split("#")[0]) == norm:
+            fuera = True
+            continue
+        nuevas.append(linea)
+    if not fuera:
+        return True
+    nuevo = "\n".join(nuevas)
+    if nuevo:
+        nuevo += "\n"
+    return _reg_escribir(nuevo, token) == "ok"
+
+
 def activar_clave(texto):
-    """Valida la clave (firma + revocación por internet UNA sola vez) y
-    guarda la activación local. Devuelve (ok, motivo)."""
+    """Valida la clave (firma + revocación + UN SOLO USO por internet,
+    una sola vez) y guarda la activación local. Devuelve (ok, motivo).
+    Las claves permanentes son exentas: no se registran ni gastan."""
     ok, motivo, info = clave_validar(texto)
     if not ok:
         return False, motivo
     norm = clave_normalizar(texto)
     if _clave_revocada(norm) is True:
         return False, "revocada"
+    es_permanente = info["tipo"] == "permanente"
+    if not es_permanente:
+        estado_reg = _reg_agregar(norm)
+        if estado_reg == "usada":
+            return False, "usada"
+        if estado_reg:
+            return False, "sin-internet"
     import datetime
     hoy = datetime.date.today()
     vence = ""
-    if info["dias"]:
+    if info["tipo"] == "diaria":
+        vence = hoy.isoformat()       # dura hasta el final de HOY
+    elif info["dias"]:
         vence = (hoy + datetime.timedelta(days=info["dias"])).isoformat()
-    _escribe_json(ACTIVACION_FILE, {
-        "clave": norm, "tipo": info["tipo"], "dias": info["dias"],
-        "activada": hoy.isoformat(), "vence": vence})
+    try:
+        _escribe_json(ACTIVACION_FILE, {
+            "clave": norm, "tipo": info["tipo"], "dias": info["dias"],
+            "activada": hoy.isoformat(), "vence": vence})
+    except Exception:
+        if not es_permanente:
+            _reg_quitar(norm)         # rollback: no la dejo gastada
+        return False, "error"
     return True, ""
 
 
@@ -1438,7 +1577,7 @@ def _dialogo_activacion(root, motivo=""):
     import threading
     win = tk.Toplevel(root)
     win.title("Activar AutoPiano")
-    win.geometry("560x420")
+    win.geometry("560x540")
     win.configure(bg="#2b2b2b")
     win.grab_set()
     win.resizable(False, False)
@@ -1464,7 +1603,8 @@ def _dialogo_activacion(root, motivo=""):
     tk.Label(win, text=aviso, bg="#2b2b2b", fg=color,
              font=("Segoe UI", 11), wraplength=520, justify="left"
              ).pack(anchor="w", padx=18)
-    tk.Label(win, text="Tipos de clave:  semanal (7 días) · mensual (30) ·\n"
+    tk.Label(win, text="Tipos de clave:  diaria (hoy, gratis viendo 1\n"
+                       "anuncio) · semanal (7 días) · mensual (30) ·\n"
                        "anual (365) · permanente (no vence). El reloj\n"
                        "empieza cuando la activás.",
              bg="#2b2b2b", fg="#aaaaaa", font=("Segoe UI", 10),
@@ -1490,6 +1630,8 @@ def _dialogo_activacion(root, motivo=""):
     def activar():
         texto = entrada.get()
         btn_act.config(state="disabled")
+        btn_regalo.config(state="disabled")
+        btn_reclamar.config(state="disabled")
         estado.config(text="⏳ Validando clave…", fg="#ffe066")
         caja = {}                    # el hilo sólo deja el resultado acá
 
@@ -1509,11 +1651,20 @@ def _dialogo_activacion(root, motivo=""):
                 "falsificada": "Clave incorrecta o alterada.",
                 "desconocida": "Tipo de clave desconocido.",
                 "revocada": "Esta clave fue revocada por el creador.",
+                "usada": ("Esa clave ya fue usada: cada clave sirve una "
+                          "sola vez. Pedí una nueva o comprá otra."),
+                "sin-internet": ("No se pudo conectar con el registro de "
+                                 "claves. Revisá tu internet y probá "
+                                 "otra vez."),
+                "error": ("No se pudo guardar la activación. "
+                          "Cerrá y volvé a intentar."),
             }
             estado.config(
                 text=motivos.get(res[1], f"No se pudo activar: {res[1]}"),
                 fg="#ffd7d7")
             btn_act.config(state="normal")
+            btn_regalo.config(state="normal")
+            btn_reclamar.config(state="normal")
             entrada.focus_set()
             entrada.select_range(0, "end")
 
@@ -1527,7 +1678,7 @@ def _dialogo_activacion(root, motivo=""):
                 return
             if "res" in caja:
                 done(caja["res"])
-            elif n < 200:            # 100 ms x 200 = 20 s (la red tarda <= 8)
+            elif n < 400:            # 100 ms x 400 = 40 s (red + registro)
                 root.after(100, lambda: vigilar(n + 1))
             else:
                 done((False, "error: sin respuesta"))
@@ -1546,6 +1697,67 @@ def _dialogo_activacion(root, motivo=""):
               fg="white", font=("Segoe UI", 12), relief="flat",
               padx=14, pady=4).pack(side="right", expand=True, fill="x",
                                     padx=(6, 0))
+
+    # ---------- 🎁 clave diaria gratis viendo 1 anuncio (v4.25) --------
+    regalo_f = tk.Frame(win, bg="#2b2b2b")
+    regalo_f.pack(fill="x", padx=18, pady=(14, 0))
+
+    def regalo():
+        """Abre el anuncio en el navegador y arranca la cuenta
+        regresiva; al terminar aparece el botón para reclamar."""
+        if not ANUNCIO_URL:
+            estado.config(text="⏳ Próximamente: clave diaria gratis con "
+                               "1 anuncio.", fg="#ffe066")
+            return
+        try:
+            webbrowser.open(ANUNCIO_URL)
+        except Exception:
+            estado.config(text="No se pudo abrir el anuncio en el "
+                               "navegador.", fg="#ffd7d7")
+            return
+        btn_regalo.config(state="disabled")
+        restante = {"n": max(0, int(ANUNCIO_ESPERA))}
+
+        def cuenta():
+            if not win.winfo_exists():
+                return
+            if restante["n"] <= 0:
+                btn_reclamar.pack(fill="x")
+                estado.config(text="✅ Listo: reclamá tu clave diaria "
+                                   "(vence hoy).", fg="#9fffa0")
+                return
+            btn_regalo.config(text=f"⏳ Esperá {restante['n']} s para "
+                                   f"reclamar…")
+            restante["n"] -= 1
+            root.after(1000, cuenta)
+
+        cuenta()
+
+    def reclamar():
+        """Genera una clave diaria y la activa (queda anotada como
+        usada: un solo uso, vence hoy)."""
+        btn_reclamar.config(state="disabled")
+        try:
+            entrada.delete(0, "end")
+            entrada.insert(0, clave_generar("diaria"))
+        except Exception as e:
+            estado.config(text=f"No se pudo generar la clave: {e}",
+                          fg="#ffd7d7")
+            btn_reclamar.config(state="normal")
+            return
+        activar()
+
+    btn_regalo = tk.Button(
+        regalo_f, text="🎁 Ver 1 anuncio y usar gratis hoy",
+        command=regalo, bg="#8a5cd6", fg="white",
+        font=("Segoe UI", 12, "bold"), relief="flat", padx=14, pady=4)
+    btn_regalo.pack(fill="x")
+    btn_reclamar = tk.Button(
+        regalo_f, text="✅ Ya lo vi — reclamar clave diaria",
+        command=reclamar, bg="#3a7d44", fg="white",
+        font=("Segoe UI", 12, "bold"), relief="flat", padx=14, pady=4)
+    # sólo se muestra cuando termina la cuenta regresiva
+
     entrada.bind("<Return>", lambda _e: activar())
     win.protocol("WM_DELETE_WINDOW", salir)
     entrada.focus_set()
@@ -1656,7 +1868,7 @@ def _posicion_mouse():
 
 
 class AutoPianoApp:
-    VERSION = "4.24"   # bump al hacer cambios: se ve en el título de la ventana
+    VERSION = "4.25"   # bump al hacer cambios: se ve en el título de la ventana
 
     def __init__(self, root: tk.Tk):
         self.root = root
