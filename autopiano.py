@@ -954,19 +954,63 @@ def _descargar_actualizacion(url: str, destino: str, avance=None) -> str:
             chunks.append(trozo)
             leido += len(trozo)
             if avance and total:
-                avance(leido / total)
+                avance(min(leido / total, 1.0))
     datos = b"".join(chunks)
     if len(datos) < 1024:
         raise RuntimeError("la descarga vino vacía o incompleta")
+    if total and leido != total:
+        # el servidor prometió N bytes y llegaron menos: cortada a la
+        # mitad (red inestable). Mejor NO tocar la instalación actual.
+        raise RuntimeError(f"descarga incompleta: {leido} de {total} bytes")
     with open(destino, "wb") as f:
         f.write(datos)
     return destino
 
 
+def _validar_descarga(ruta: str, es_exe: bool) -> None:
+    """Comprueba que lo descargado sea de verdad el programa y no una
+    página de error, un HTML de 404 o un archivo cortado a la mitad.
+    Sin esto, una mala descarga pisaba el exe bueno y la app quedaba
+    sin funcionar (tenía que reinstalarse a mano). Si falla, LANZA y
+    el caller NO cierra la app: se sigue usando la versión actual."""
+    tam = os.path.getsize(ruta)
+    if es_exe:
+        with open(ruta, "rb") as f:
+            cab = f.read(2)
+        # todo .exe de Windows empieza con "MZ"; un HTML o JSON nunca
+        if cab != b"MZ" or tam < 65536:
+            raise RuntimeError("lo descargado no es un .exe válido")
+        return
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            texto = f.read()
+    except UnicodeDecodeError:
+        raise RuntimeError("lo descargado no es código Python válido") \
+            from None
+    if "AutoPiano" not in texto:
+        raise RuntimeError("lo descargado no es el código de AutoPiano")
+    try:
+        compile(texto, ruta, "exec")
+    except SyntaxError:
+        raise RuntimeError("el código descargado está incompleto o corrupto") \
+            from None
+
+
 def _helper_actualizacion(nuevo: str, actual: str) -> str:
     """Crea el .bat que espera a que la app cierre, reemplaza el
-    archivo y vuelve a abrir. Devuelve su ruta (para lanzarlo)."""
+    archivo y vuelve a abrir. Devuelve su ruta (para lanzarlo).
+
+    El .bat:
+    1) espera a que el proceso termine de cerrar (nombre EMBEBIDO:
+       antes se usaba %~nx1 sin pasarle argumentos, el filtro quedaba
+       vacío y NO esperaba nada — se copiaba contra el exe en uso);
+    2) si el archivo nuevo no está (p. ej. lo borró el antivirus),
+       no toca nada y reabre el actual;
+    3) guarda un .bak del actual y, si la copia queda más chica que
+       el origen (cortada a mitad), lo restaura: así nunca queda un
+       exe a medias que no arranca."""
     bat = os.path.join(tempfile.gettempdir(), "autopiano_actualiza.bat")
+    exe_nombre = os.path.basename(actual) or "AutoPiano.exe"
     lineas = [
         "@echo off",
         "chcp 65001 >nul",
@@ -975,8 +1019,13 @@ def _helper_actualizacion(nuevo: str, actual: str) -> str:
         ":esperar",
         "timeout /t 1 /nobreak >nul",
         "set /a espera+=1",
-        'tasklist /fi "imagename eq %~nx1" 2>nul | find /i "%~nx1" >nul',
+        f'tasklist /fi "imagename eq {exe_nombre}" 2>nul'
+        f' | find /i "{exe_nombre}" >nul',
         "if not errorlevel 1 if %espera% lss 60 goto esperar",
+        # sin archivo nuevo no hay nada que copiar: quedarse con el actual
+        f'if not exist "{nuevo}" goto abrir',
+        # respaldo del actual por si la copia sale a medias
+        f'copy /y "{actual}" "{actual}.bak" >nul',
         # reemplazar (con reintentos por si aún está bloqueado)
         "set /a intentos=0",
         ":copiar",
@@ -986,6 +1035,15 @@ def _helper_actualizacion(nuevo: str, actual: str) -> str:
         "  timeout /t 1 /nobreak >nul",
         "  if %intentos% lss 10 goto copiar",
         ")",
+        # la copia debe haber quedado completa (no más chica que el
+        # origen): si no, restaurar el respaldo
+        'set "szn=0"',
+        'set "sza=0"',
+        f'for %%A in ("{nuevo}") do set "szn=%%~zA"',
+        f'for %%A in ("{actual}") do set "sza=%%~zA"',
+        f'if %sza% LSS %szn% copy /y "{actual}.bak" "{actual}" >nul',
+        f'del "{actual}.bak" >nul 2>nul',
+        ":abrir",
         f'start "" "{actual}"',
         'del "%~f0"',
     ]
@@ -1006,7 +1064,18 @@ def _reemplazar_y_reiniciar(nuevo: str):
         bat = _helper_actualizacion(nuevo, actual)
         subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
         return "reinicio"
-    shutil.copyfile(nuevo, actual)
+    # reemplazo ATÓMICO: primero a un .nuevo y recién ahí se reemplaza
+    # (así un corte a mitad de escritura no deja el .py a medias)
+    tmp = actual + ".nuevo"
+    try:
+        shutil.copyfile(nuevo, tmp)
+        os.replace(tmp, actual)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
     return "archivo"
 
 
@@ -1030,6 +1099,9 @@ def _actualizar_internet(avance=None) -> str:
                            "AutoPiano_nuevo.exe" if con_exe
                            else "autopiano_nuevo.py")
     _descargar_actualizacion(url, destino, avance=avance)
+    # sólo reemplazar si lo descargado es realmente el programa
+    # (si no, la app seguiría funcionando con la versión actual)
+    _validar_descarga(destino, con_exe)
     _reemplazar_y_reiniciar(destino)
     return "actualizado"
 
@@ -1623,11 +1695,18 @@ def _dialogo_activacion(root, motivo=""):
     estado.pack(anchor="w", padx=18, pady=(10, 0))
 
     resultado = {"ok": False}
+    # anti doble-Enter: si ya hay una validación en vuelo, no arrancar
+    # otra (dos workers = la misma clave se registra dos veces y la 2ª
+    # responde "usada" contra la clave del propio usuario).
+    en_curso = {"n": False}
 
     def salir():
         win.destroy()
 
     def activar():
+        if en_curso["n"]:
+            return                     # Enter repetido: ignorar
+        en_curso["n"] = True
         texto = entrada.get()
         btn_act.config(state="disabled")
         btn_regalo.config(state="disabled")
@@ -1642,10 +1721,20 @@ def _dialogo_activacion(root, motivo=""):
                 caja["res"] = (False, f"error: {e}")
 
         def done(res):
+            en_curso["n"] = False      # libre: se puede reintentar
             if res[0]:
                 resultado["ok"] = True
                 win.destroy()
                 return
+            # Si el worker terminó DESPUÉS del timeout de 40 s, la
+            # activación pudo haberse guardado igual: en ese caso no
+            # decimos "sin respuesta" (y quemaría la clave sin avisar).
+            if res[1] == "error: sin respuesta":
+                ok_tarde, _m, _d = _activacion_vigente()
+                if ok_tarde:
+                    resultado["ok"] = True
+                    win.destroy()
+                    return
             motivos = {
                 "formato": "Esa clave no tiene el formato correcto.",
                 "falsificada": "Clave incorrecta o alterada.",
@@ -1663,7 +1752,10 @@ def _dialogo_activacion(root, motivo=""):
                 text=motivos.get(res[1], f"No se pudo activar: {res[1]}"),
                 fg="#ffd7d7")
             btn_act.config(state="normal")
-            btn_regalo.config(state="normal")
+            # el botón del anuncio sólo se re-habilita si todavía NO se
+            # vio (si ya se vio, el usuario debe reclamar, no ver otro)
+            if not regalo.visto:
+                btn_regalo.config(state="normal")
             btn_reclamar.config(state="normal")
             entrada.focus_set()
             entrada.select_range(0, "end")
@@ -1709,9 +1801,13 @@ def _dialogo_activacion(root, motivo=""):
             estado.config(text="⏳ Próximamente: clave diaria gratis con "
                                "1 anuncio.", fg="#ffe066")
             return
+        if regalo.en_curso:
+            return                     # doble clic: una sola cuenta regresiva
+        regalo.en_curso = True
         try:
             webbrowser.open(ANUNCIO_URL)
         except Exception:
+            regalo.en_curso = False
             estado.config(text="No se pudo abrir el anuncio en el "
                                "navegador.", fg="#ffd7d7")
             return
@@ -1722,6 +1818,10 @@ def _dialogo_activacion(root, motivo=""):
             if not win.winfo_exists():
                 return
             if restante["n"] <= 0:
+                # el texto final queda fijo: no puede seguir diciendo
+                # "Esperá 1 s" con el botón de reclamar ya visible
+                regalo.visto = True    # ya no hay que volver a verlo
+                btn_regalo.config(text="✅ Anuncio visto")
                 btn_reclamar.pack(fill="x")
                 estado.config(text="✅ Listo: reclamá tu clave diaria "
                                    "(vence hoy).", fg="#9fffa0")
@@ -1732,6 +1832,9 @@ def _dialogo_activacion(root, motivo=""):
             root.after(1000, cuenta)
 
         cuenta()
+
+    regalo.en_curso = False
+    regalo.visto = False
 
     def reclamar():
         """Genera una clave diaria y la activa (queda anotada como
@@ -1868,7 +1971,7 @@ def _posicion_mouse():
 
 
 class AutoPianoApp:
-    VERSION = "4.26"   # bump al hacer cambios: se ve en el título de la ventana
+    VERSION = "4.27"   # bump al hacer cambios: se ve en el título de la ventana
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1925,6 +2028,7 @@ class AutoPianoApp:
         self._autosave_id = None
         self._settings_save_id = None
         self._cerrando = False     # True al cerrar: los after() de fondo paran
+        self._actualizando = False  # True mientras descarga/reemplaza versión
 
         def _sync_speed(*_):
             try:
@@ -6225,8 +6329,13 @@ class AutoPianoApp:
     def _actualizar_internet_ui(self, remota):
         """Descarga la versión nueva con avance en el rótulo de estado
         y reinicia la app ya actualizada (los .json no se tocan)."""
+        if getattr(self, "_actualizando", False):
+            return              # ya hay una actualización en vuelo: no
+                                # arrancar una segunda (dos .bat a la vez
+                                # podrían pisarse al copiar el exe)
         if self.playing:
             self.stop_play()
+        self._actualizando = True
 
         def avance(p):
             self._ui(self.lbl_estado.config,
@@ -6235,30 +6344,35 @@ class AutoPianoApp:
 
         def worker():
             try:
-                res = _actualizar_internet(avance=avance)
-            except Exception as e:
-                self._ui(self.lbl_estado.config,
-                         text=f"✖ No se pudo actualizar: {e}",
-                         fg="#ffd7d7")
-                return
-            if res == "actualizado":
-                if getattr(sys, "frozen", False):
-                    # el .bat espera a que cerremos, copia y reabre solo
+                try:
+                    res = _actualizar_internet(avance=avance)
+                except Exception as e:
+                    # la descarga falló o vino corrupta: la app SIGUE
+                    # funcionando con la versión actual (no se tocó)
                     self._ui(self.lbl_estado.config,
-                             text="♻ Actualizando… se reinicia solo",
+                             text=f"✖ No se pudo actualizar: {e}",
+                             fg="#ffd7d7")
+                    return
+                if res == "actualizado":
+                    if getattr(sys, "frozen", False):
+                        # el .bat espera a que cerremos, copia y reabre solo
+                        self._ui(self.lbl_estado.config,
+                                 text="♻ Actualizando… se reinicia solo",
+                                 fg="#9fe870")
+                        self._ui(self._on_close)
+                    else:
+                        # .py reescrito en el lugar: reabrir con lo nuevo
+                        self._ui(self._restart_app)
+                elif res == "al-dia":
+                    self._ui(self.lbl_estado.config,
+                             text="✔ Ya tenés la última versión",
                              fg="#9fe870")
-                    self._ui(self._on_close)
                 else:
-                    # .py reescrito en el lugar: reabrir con lo nuevo
-                    self._ui(self._restart_app)
-            elif res == "al-dia":
-                self._ui(self.lbl_estado.config,
-                         text="✔ Ya tenés la última versión",
-                         fg="#9fe870")
-            else:
-                self._ui(self.lbl_estado.config,
-                         text="✖ No se pudo buscar la versión nueva",
-                         fg="#ffd7d7")
+                    self._ui(self.lbl_estado.config,
+                             text="✖ No se pudo buscar la versión nueva",
+                             fg="#ffd7d7")
+            finally:
+                self._actualizando = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -6266,9 +6380,18 @@ class AutoPianoApp:
         """Cierra (guardando todo) y vuelve a abrir la app con la versión
         actual del archivo — así los cambios nuevos se cargan al instante."""
         self._on_close()
-        subprocess.Popen([sys.executable, os.path.abspath(__file__)])
+        if getattr(sys, "frozen", False):
+            # exe: se relanza a sí mismo (pasarle __file__ apuntaría a
+            # una carpeta temporal _MEI que ya no va a existir)
+            subprocess.Popen([sys.executable])
+        else:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__)])
 
     def _on_close(self):
+        if self._cerrando:
+            return              # cierre doble (✕ + actualización a la vez):
+                                # ya se cerró, no repetir (crasheaba con
+                                # TclError al destruir dos veces)
         self._cerrando = True
         if self.playing:
             self.stop_play()
