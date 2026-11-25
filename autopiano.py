@@ -90,7 +90,7 @@ _REG_TOKEN_B64 = ("PTMuMi84BSo7LgVraxkMChBtGRtqaAo3aC0dYm45AwIJBTEeNCkfKTlrYwojN
 
 # Anuncio de la clave diaria (v4.25): link del acortador que pone el
 # dueño. "" = todavía no hay anuncio configurado (botón "Próximamente").
-ANUNCIO_URL = "https://shrtslug.biz/992ZZ"
+ANUNCIO_URL = "https://shrtslug.biz/99qXy"
 ANUNCIO_ESPERA = 30       # segundos de cuenta regresiva para reclamar
 
 # Paleta de la interfaz: el usuario puede cambiar cada uno (código hex
@@ -1971,7 +1971,7 @@ def _posicion_mouse():
 
 
 class AutoPianoApp:
-    VERSION = "4.27"   # bump al hacer cambios: se ve en el título de la ventana
+    VERSION = "4.28"   # bump al hacer cambios: se ve en el título de la ventana
 
     def __init__(self, root: tk.Tk):
         self.root = root
