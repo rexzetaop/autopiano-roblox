@@ -316,6 +316,59 @@ def _escribe_json(path, datos):
     os.replace(tmp, path)
 
 
+def _sanear_settings(datos):
+    """Ajusta cada valor al TIPO esperado por DEFAULT_SETTINGS.
+
+    Si el archivo fue editado a mano, viene de otra versión o trae un
+    respaldo ajeno con tipos raros ("countdown": "hola", None, una
+    lista…), se usa el valor por defecto en vez de dejar que int()/float()
+    revienten al arrancar (antes, eso impedía que la app abriera y había
+    que arreglar el JSON a mano)."""
+    limpio = dict(DEFAULT_SETTINGS)
+    for k, v in (datos or {}).items():
+        if k not in limpio:
+            continue
+        exp = limpio[k]
+        try:
+            if isinstance(exp, bool):
+                # bool aparte: en Python bool es subclase de int
+                if isinstance(v, bool):
+                    limpio[k] = v
+                elif isinstance(v, str) and v.strip().lower() in (
+                        "true", "false", "1", "0", "yes", "no"):
+                    limpio[k] = v.strip().lower() in ("true", "1", "yes")
+                elif isinstance(v, (int, float)):
+                    limpio[k] = bool(v)
+                # cualquier otra cosa: se queda el default
+            elif isinstance(exp, int):
+                if isinstance(v, bool) or not isinstance(
+                        v, (int, float, str)):
+                    continue                # bool/lista/None: default
+                limpio[k] = int(float(v))   # tolera "10" y 10.0
+            elif isinstance(exp, float):
+                if isinstance(v, bool) or not isinstance(
+                        v, (int, float, str)):
+                    continue
+                limpio[k] = float(v)
+            elif isinstance(exp, str):
+                limpio[k] = str(v)
+            else:
+                limpio[k] = v
+        except (ValueError, TypeError):
+            limpio[k] = exp                 # no se pudo convertir: default
+    return limpio
+
+
+def _entero_seguro(valor, defecto=0):
+    """int() que nunca lanza: '10', 10.0 y True pasan; basura -> defecto."""
+    try:
+        if isinstance(valor, bool):
+            return defecto
+        return int(float(valor))
+    except (ValueError, TypeError):
+        return defecto
+
+
 def _tokenize_sheet(text: str):
     """Tokeniza la partitura. Devuelve [(inicio, fin, grupo)] con las
     posiciones de cada grupo en el texto (para el resaltado) y el grupo
@@ -1971,7 +2024,7 @@ def _posicion_mouse():
 
 
 class AutoPianoApp:
-    VERSION = "4.28"   # bump al hacer cambios: se ve en el título de la ventana
+    VERSION = "4.29"   # bump al hacer cambios: se ve en el título de la ventana
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -2696,9 +2749,9 @@ class AutoPianoApp:
                 # utf-8-sig: tolera archivos guardados con BOM (Bloc de notas…)
                 with open(SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
-                merged = dict(DEFAULT_SETTINGS)
-                merged.update({k: v for k, v in data.items() if k in merged})
-                return merged
+                # valida TIPOS: un JSON editado a mano con valores raros
+                # ya no impide que la app arranque
+                return _sanear_settings(data)
             except Exception:
                 # respaldar el archivo dañado (no perderlo)
                 try:
@@ -2938,6 +2991,9 @@ class AutoPianoApp:
         self._save_settings_quiet()
 
     def _apply_settings(self):
+        # sanea por si algo escribió un tipo raro (respaldo ajeno, JSON
+        # editado): nunca debe reventar int()/float() acá
+        self.settings = _sanear_settings(self.settings)
         s = self.settings
         # blindado: aplicar la config GLOBAL no debe escribir overrides
         # de canción ni contaminar la config de la canción seleccionada
@@ -3873,8 +3929,15 @@ class AutoPianoApp:
         if not nombres:
             return "break"
         try:
-            x, y, w, h = self.listbox.bbox(sel[-1])
-        except (tk.TclError, ValueError):
+            caja = self.listbox.bbox(sel[-1])
+            # bbox() devuelve None si el item está fuera del scroll (lista
+            # larga): desempaquetar None lanzaba TypeError y la tecla M
+            # no hacía nada (se salteaba el except, que sólo cubría
+            # TclError/ValueError)
+            if not caja:
+                return "break"
+            x, y, w, h = caja
+        except (tk.TclError, ValueError, TypeError):
             return "break"
         self._elegir_destino_y_mover(
             nombres, self.listbox.winfo_rootx() + x + w + 12,
@@ -4566,7 +4629,19 @@ class AutoPianoApp:
                     if isinstance(racha, dict):
                         self.records["racha"] = {
                             "ultimo_dia": str(racha.get("ultimo_dia", "")),
-                            "dias": int(racha.get("dias", 0) or 0)}
+                            "dias": _entero_seguro(racha.get("dias", 0))}
+                    # tipos raros a mano: arreglarlos ya (sino, el +1 de
+                    # _registrar_toco revienta al apretar ▶)
+                    for fila in self.records["canciones"].values():
+                        fila["tocadas"] = _entero_seguro(
+                            fila.get("tocadas", 0))
+                        fila["completadas"] = _entero_seguro(
+                            fila.get("completadas", 0))
+                        try:
+                            fila["mejor_vel"] = float(
+                                fila.get("mejor_vel", 0) or 0)
+                        except (ValueError, TypeError):
+                            fila["mejor_vel"] = 0.0
             except Exception:
                 pass
 
@@ -4583,7 +4658,7 @@ class AutoPianoApp:
         canc = self.records.setdefault("canciones", {})
         fila = canc.setdefault(name, {"tocadas": 0, "completadas": 0,
                                       "mejor_vel": 0.0})
-        fila["tocadas"] = int(fila.get("tocadas", 0)) + 1
+        fila["tocadas"] = _entero_seguro(fila.get("tocadas", 0)) + 1
         hoy = time.strftime("%Y-%m-%d")
         racha = self.records.setdefault(
             "racha", {"ultimo_dia": "", "dias": 0})
@@ -4592,7 +4667,7 @@ class AutoPianoApp:
         if racha.get("ultimo_dia") == hoy:
             pass                         # ya contó hoy
         elif racha.get("ultimo_dia") == ayer:
-            racha["dias"] = int(racha.get("dias", 0) or 0) + 1
+            racha["dias"] = _entero_seguro(racha.get("dias", 0)) + 1
         else:
             racha["dias"] = 1             # primer día (o se cortó la racha)
         racha["ultimo_dia"] = hoy
@@ -4605,12 +4680,17 @@ class AutoPianoApp:
         canc = self.records.setdefault("canciones", {})
         fila = canc.setdefault(name, {"tocadas": 0, "completadas": 0,
                                       "mejor_vel": 0.0})
-        fila["completadas"] = int(fila.get("completadas", 0)) + 1
+        fila["completadas"] = _entero_seguro(
+            fila.get("completadas", 0)) + 1
         try:
             vel = float(self.speed)
         except (ValueError, tk.TclError):
             vel = 0.0
-        if vel > float(fila.get("mejor_vel", 0) or 0):
+        try:
+            mejor = float(fila.get("mejor_vel", 0) or 0)
+        except (ValueError, TypeError):
+            mejor = 0.0
+        if vel > mejor:
             fila["mejor_vel"] = round(vel, 2)
         self._guardar_records()
 
@@ -4631,10 +4711,15 @@ class AutoPianoApp:
                 "Escribe letras (q w e r t y u…) y usa ( ) para acordes.")
             return
         self.pos = self._cursor_group_pos() if self.start_at_cursor else 0
+        # los récords NUNCA deben frenar el play: si algo falla acá, el
+        # botón ▶ quedaba muerto (playing=True sin worker arrancado)
+        try:
+            self._registrar_toco()      # v4.23: récords (tocadas + racha)
+        except Exception:
+            pass
         self.playing = True
         self.paused = False
         self.stop_flag = False
-        self._registrar_toco()        # v4.23: récords (tocadas + racha)
         self._release_all_held()      # limpiar teclas de una sesión anterior
         self._update_progress()
         self.btn_play.config(state="disabled")
@@ -6117,9 +6202,11 @@ class AutoPianoApp:
         self._save_scores()
         ajustes = datos.get("settings")
         if isinstance(ajustes, dict):
-            for k, v in ajustes.items():
-                if k in DEFAULT_SETTINGS:
-                    self.settings[k] = v
+            limpio = _sanear_settings(ajustes)
+            # sólo las claves que el respaldo TRAE (sanear devuelve todas)
+            for k in ajustes:
+                if k in limpio:
+                    self.settings[k] = limpio[k]
             self._save_settings()
             self._apply_settings()
         # configuración personalizada de cada canción (respaldos nuevos);
