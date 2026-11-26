@@ -369,6 +369,54 @@ def _entero_seguro(valor, defecto=0):
         return defecto
 
 
+_CLAVES_SONG = ("speed", "hold_ms", "realism", "base_gap")
+
+
+def _sanear_song_cfg(datos):
+    """Sanea la config personalizada de UNA canción a los tipos que la
+    app espera (speed/hold_ms/realism/base_gap).
+
+    Un autopiano_songsettings.json editado a mano con null o con una
+    lista hacía reventar int()/float() al seleccionar la canción —o
+    directamente al arrancar— y la app no abría. Lo raro se descarta y
+    queda el valor global."""
+    limpio = {}
+    for k, v in (datos or {}).items():
+        if k not in _CLAVES_SONG or isinstance(v, bool):
+            continue                       # bool: no es un número acá
+        try:
+            if k == "hold_ms":
+                limpio[k] = max(int(float(v)), 0)
+            else:
+                limpio[k] = float(v)
+        except (TypeError, ValueError):
+            continue                       # valor raro: se ignora
+    return limpio
+
+
+def _cuerpo_partitura(v):
+    """Cuerpo de partitura SIEMPRE como str: Text.insert revienta con
+    None (TclError 'wrong # args'), así que un JSON raro se convierte."""
+    if isinstance(v, str):
+        return v
+    if v is None:
+        return ""
+    if isinstance(v, (int, float, bool)):
+        return str(v)
+    return ""                              # listas/dicts: sin forma útil
+
+
+def _respaldar_corrupto(path):
+    """Copia un archivo de datos ilegible o con forma rara a
+    .corrupto-fecha: así un guardado posterior no pisa los datos
+    originales y se pueden recuperar a mano."""
+    try:
+        shutil.copyfile(path, path + ".corrupto-"
+                        + time.strftime("%Y%m%d-%H%M%S"))
+    except Exception:
+        pass
+
+
 def _tokenize_sheet(text: str):
     """Tokeniza la partitura. Devuelve [(inicio, fin, grupo)] con las
     posiciones de cada grupo en el texto (para el resaltado) y el grupo
@@ -2660,15 +2708,18 @@ class AutoPianoApp:
             try:
                 # utf-8-sig: tolera archivos guardados con BOM (Bloc de notas…)
                 with open(SCORES_FILE, "r", encoding="utf-8-sig") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                # valida la FORMA: dict de partitura -> texto. Una lista
+                # (JSON editado a mano) hacía reventar al listar y un
+                # cuerpo None reventaba Text.insert al seleccionarla.
+                if isinstance(data, dict):
+                    return {k: _cuerpo_partitura(v)
+                            for k, v in data.items() if isinstance(k, str)}
+                _respaldar_corrupto(SCORES_FILE)   # no es un dict: guardarlo
             except Exception:
                 # archivo dañado (corte de luz, cierre forzado…): respaldarlo
                 # para poder recuperarlo a mano y no perderlo para siempre
-                try:
-                    shutil.copyfile(SCORES_FILE, SCORES_FILE + ".corrupto-"
-                                    + time.strftime("%Y%m%d-%H%M%S"))
-                except Exception:
-                    pass
+                _respaldar_corrupto(SCORES_FILE)
         return dict(DEFAULT_SCORES)
 
     def _save_scores(self):
@@ -2768,8 +2819,12 @@ class AutoPianoApp:
                 with open(SONG_SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    return {k: dict(v) for k, v in data.items()
+                    # sanea TIPOS: null o una lista en la config de una
+                    # canción hacía reventar al seleccionarla (o al
+                    # arrancar, si era la canción abierta al inicio)
+                    return {k: _sanear_song_cfg(v) for k, v in data.items()
                             if isinstance(v, dict)}
+                _respaldar_corrupto(SONG_SETTINGS_FILE)   # forma rara
             except Exception:
                 try:
                     shutil.copyfile(SONG_SETTINGS_FILE, SONG_SETTINGS_FILE
@@ -2799,12 +2854,12 @@ class AutoPianoApp:
                     (self.realism_var, "realism", float)):
                 try:
                     var.set(cast(ov.get(key, self.settings[key])))
-                except (KeyError, ValueError, tk.TclError):
+                except (KeyError, ValueError, TypeError, tk.TclError):
                     pass
             try:
                 self.base_gap = float(ov.get("base_gap",
                                              self.settings["base_gap"]))
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, TypeError):
                 pass
         finally:
             self._aplicando_song = False
@@ -2868,7 +2923,8 @@ class AutoPianoApp:
                     i += 1
             self.scores[destino] = cuerpo
             if isinstance(cfgs.get(nombre), dict):
-                self._song_overrides[destino] = dict(cfgs[nombre])
+                self._song_overrides[destino] = _sanear_song_cfg(
+                    cfgs[nombre])
             llegan.append((destino, nombre))
             cambios += 1
         if cambios:
@@ -6213,7 +6269,8 @@ class AutoPianoApp:
         # los respaldos viejos no la traen y no se pierde nada por eso
         song = datos.get("song_settings")
         if isinstance(song, dict):
-            self._song_overrides = {k: dict(v) for k, v in song.items()
+            self._song_overrides = {k: _sanear_song_cfg(v)
+                                    for k, v in song.items()
                                     if isinstance(v, dict) and k in self.scores}
             self._guardar_song_settings()
         # paleta de colores del respaldo, si trae (los viejos no traen)
